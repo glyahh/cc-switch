@@ -1,0 +1,104 @@
+name: Codex fork usage preflight
+'on':
+  push:
+    branches:
+    - ci/codex-fork-usage-7699-validation
+permissions:
+  contents: read
+concurrency:
+  group: codex-fork-preflight
+  cancel-in-progress: true
+jobs:
+  backend:
+    name: Backend Checks
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+        - ubuntu-22.04
+        - windows-latest
+        - macos-latest
+    steps:
+    - name: Prepare isolated test home
+      shell: bash
+      run: 'test_home="$RUNNER_TEMP/cc-switch-fork-preflight-home"
+
+        mkdir -p "$test_home"
+
+        echo "CC_SWITCH_TEST_HOME=$test_home" >> "$GITHUB_ENV"
+
+        echo "HERMES_HOME=" >> "$GITHUB_ENV"'
+    - name: Checkout
+      uses: actions/checkout@v6
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    - name: Install Linux system deps
+      if: runner.os == 'Linux'
+      run: "sudo apt-get update\nsudo apt-get install -y --no-install-recommends \\\n  build-essential pkg-config libssl-dev \\\n  libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev\nsudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev \\\n  || sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.0-dev\nsudo apt-get install -y --no-install-recommends libsoup-3.0-dev \\\n  || sudo apt-get install -y --no-install-recommends libsoup2.4-dev\n"
+    - name: Cache Cargo registry and build
+      uses: actions/cache@v5
+      with:
+        path: '~/.cargo/registry
+
+          ~/.cargo/git
+
+          src-tauri/target
+
+          '
+        key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-cargo-
+    - name: Create frontend dist placeholder
+      shell: bash
+      run: mkdir -p dist
+    - name: Check Rust formatting
+      run: cargo fmt --check --manifest-path src-tauri/Cargo.toml
+    - name: Clippy
+      run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+    - name: Run tests
+      run: cargo test --manifest-path src-tauri/Cargo.toml
+  backend-windows-wsl2:
+    name: Backend Checks (Windows + WSL2 home)
+    runs-on: windows-2025
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+    - name: Setup WSL2
+      uses: Vampire/setup-wsl@d1da7f2c0322a5ee4f24975344f67fc0f5baf364
+      with:
+        distribution: Ubuntu-24.04
+        wsl-version: 2
+    - name: Cache Cargo registry and build
+      uses: actions/cache@v5
+      with:
+        path: '~/.cargo/registry
+
+          ~/.cargo/git
+
+          src-tauri/target
+
+          '
+        key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-cargo-
+    - name: Create frontend dist placeholder
+      shell: bash
+      run: mkdir -p dist
+    - name: Prepare WSL2-backed test environment
+      shell: pwsh
+      run: "wsl.exe -d Ubuntu-24.04 -- bash -lc \"rm -rf /tmp/cc-switch-windows-test-root && mkdir -p /tmp/cc-switch-windows-test-root/{home,temp} && chmod -R 0777 /tmp/cc-switch-windows-test-root\"\n$testRoot = \"\\\\wsl.localhost\\Ubuntu-24.04\\tmp\\cc-switch-windows-test-root\"\n$testHome = Join-Path $testRoot \"home\"\n$testTemp = Join-Path $testRoot \"temp\"\nforeach ($path in @($testRoot, $testHome, $testTemp)) {\n  if (-not (Test-Path -LiteralPath $path)) {\n    throw \"WSL2-backed test path is unavailable: $path\"\n  }\n}\n\"CC_SWITCH_TEST_HOME=$testHome\" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append\n\"CC_SWITCH_WSL_TEST_DIR=$testRoot\" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append\n\"CC_SWITCH_WSL_TEST_TEMP=$testTemp\" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append\n"
+    - name: Compile backend tests with native temp
+      env:
+        TEMP: ${{ runner.temp }}
+        TMP: ${{ runner.temp }}
+      shell: pwsh
+      run: "$testBinary = cargo test --lib --manifest-path src-tauri/Cargo.toml --no-run --message-format=json |\n  ForEach-Object {\n    if ($_ -match '\"reason\":\"compiler-artifact\"') {\n      $artifact = $_ | ConvertFrom-Json\n      if ($artifact.executable -and $artifact.profile.test -and $artifact.target.name -eq 'cc_switch_lib') {\n        $artifact.executable\n      }\n    }\n  } | Select-Object -First 1 -Wait\nif ($LASTEXITCODE -ne 0) {\n  exit $LASTEXITCODE\n}\nif (-not $testBinary) {\n  throw \"cc_switch_lib test binary not found in cargo compiler artifacts\"\n}\n\"CC_SWITCH_TEST_EXE=$testBinary\" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append\n"
+    - name: Run Windows-to-WSL2 filesystem contract
+      shell: pwsh
+      run: "$env:TEMP = $env:CC_SWITCH_WSL_TEST_TEMP\n$env:TMP = $env:CC_SWITCH_WSL_TEST_TEMP\n$testName = \"config::tests::atomic_write_replaces_existing_wsl_unc_file\"\n$testList = & $env:CC_SWITCH_TEST_EXE --list --ignored\nif ($LASTEXITCODE -ne 0) {\n  exit $LASTEXITCODE\n}\n$expected = \"${testName}: test\"\nif ($testList -notcontains $expected) {\n  throw \"Expected ignored test was not discovered: $testName\"\n}\n& $env:CC_SWITCH_TEST_EXE $testName --ignored --exact --nocapture\nif ($LASTEXITCODE -ne 0) {\n  exit $LASTEXITCODE\n}\n"
